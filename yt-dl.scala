@@ -10,21 +10,40 @@ import sys.process._
 import scala.io.Source
 import scala.concurrent.duration._
 import scala.concurrent._
+import spray.json._
+//import DefaultJsonProtocol._
 
 object ytdt extends App {
-
+	case class Subscription(channelName: String, channelId: String)
+	case class Config(dlLoc: String, prevDldLoc: String, subList: List[Subscription])
 	case class VideoLink(name: String, url: String)
+
+	object MyJsonProt extends DefaultJsonProtocol {
+		implicit val subJsonConverter = jsonFormat(Subscription, "channelName", "channelId")
+		implicit val configJsonConverter = jsonFormat(Config, "videoDownloadLocation", "alreadyDownloadedListLocation",
+				"subscriptions")
+	}
+	import MyJsonProt._
+	
+
 	//implicit val global = ExecutionContext.fromExecutor(Executors.newFixedThreadPool(2))
 
-	def getVideoList(channelId: String, name: String) = {
+	def loadConfig(configFileLoc: String): Config = {
+		val configFileString = Source.fromFile(configFileLoc).mkString
+		val jsonObj = configFileString.parseJson
+		
+		jsonObj.convertTo[Config]
+	}
+
+	def getVideoList(sub: Subscription)(implicit conf: Config): Future[Seq[VideoLink]] = {
 		val videoListFut = future {
-			val oldUrls = getUrlsFromFile(name + ".list")
-			val feed = XML.load("https://www.youtube.com/feeds/videos.xml?channel_id=" + channelId)
+			val oldUrls = getUrlsFromFile(conf.prevDldLoc + "/" + sub.channelName + ".list")
+			val feed = XML.load("https://www.youtube.com/feeds/videos.xml?channel_id=" + sub.channelId)
 			val urlList = (feed \ "entry" \\ "@href").map( _ text).reverse
 			val titleList = (feed \ "entry" \ "title").map( _ text).reverse
 			val tmp = urlList zip titleList
 			tmp.filter( tupA => ! oldUrls.contains(tupA._1))
-				.map( tupB => VideoLink(name, tupB._1))
+				.map( tupB => VideoLink(sub.channelName, tupB._1))
 		}
 		videoListFut
 	}
@@ -38,44 +57,42 @@ object ytdt extends App {
 		}
 	}
 
-	def downloadVideo(link: VideoLink): Boolean = {
+	def downloadVideo(link: VideoLink)(implicit conf: Config): Boolean = {
 		val cmdStr = "youtube-dl -x --audio-format vorbis --restrict-filenames" +
-				" -o ~/Downloads/youbube/%(uploader)s_%(upload_date)s_%(title)s.%(ext)s " +
+				" -o " + conf.dlLoc + link.name + "/%(uploader)s_%(upload_date)s_%(title)s.%(ext)s " +
 				link.url
 		println(cmdStr)
 		if( (cmdStr !) == 0 ){
 		//add file to already downloaded
-		val fw = new FileWriter(link.name + ".list", true)
+		val fw = new FileWriter(conf.prevDldLoc + "/" + link.name + ".list", true)
 		try{
 			fw.write(link.url + "\n")
 		}
-		fw.close()
+		finally{
+			fw.close()
+		}
 	}
 	true
 	}
-val urls = List(getVideoList("UC7iaZh8Nk5i-5NuMOhk6jKA", "JanetBloomfield"),
-				getVideoList("UCcdQla_9PbQb4-FKFxJN2ag", "DrwarrenFarrell"),
-				getVideoList("UC6TJdRrZR_WacbxJWiRZ5_g", "DavisAurini"),
-				getVideoList("UCmkSQppUOY6r7qd-sbcftBQ", "TheCriticalG"),
-				getVideoList("UC-yewGHQbNFpDrGM0diZOLA", "SargonOfAkkad"),
-				getVideoList("UCr3qf3JVwW_41j4LUQZtu9Q", "BernardChapin"),
-				getVideoList("UCcmnLu5cGUGeLy744WS-fsg", "KarenStraughan"),
-				getVideoList("UCeFlOi54kYIgbJHt_1ApDpg", "TheJusticar"),
-				getVideoList("UCzOnXvfwc32YEiwTe_8Nf-g", "RockingMrE"),
-				getVideoList("UCtD9a-aXIYS6-e-8s7DISiw", "HowTheWorldWorks"),
-				getVideoList("UCy9VHF_ihqzBsx9tr0_XZIQ", "TruthRevoltOriginals"))
 
-val videos = urls map {
-		_ map { list =>
-					list map { vl =>
-						future {
-						downloadVideo(vl)
-				}		
-			}
-		}
-	}
+implicit val conf = loadConfig(System.getProperty("user.home") + "/.yt-dl/yt-dl.conf")
 
-Await.result(Future.sequence(videos), Duration.Inf)
+val fUrls: Future[List[Seq[VideoLink]]] = Future.sequence(conf.subList.map( getVideoList(_) ))
+
+val fVideos: Future[List[Boolean]] = fUrls.flatMap(
+{	ls: List[Seq[VideoLink]] => Future.sequence(
+	ls.flatMap({ svl: Seq[VideoLink] =>
+		svl.map({ vl: VideoLink =>  
+			future{
+				println(Thread.currentThread().getId())
+				downloadVideo(vl)
+			}	
+		})
+	}))
+})
+
+Await.result(fVideos, Duration.Inf)
+
 
 println("Done");
 
